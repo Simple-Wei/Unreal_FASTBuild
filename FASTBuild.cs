@@ -444,7 +444,7 @@ namespace UnrealBuildTool
 			{
 				// This may fail if the caller emptied PATH; we try to ignore the problem since
 				// it probably means we are building for another platform.
-				VCEnv = VCEnvironment.SetEnvironment(CppPlatform.Win64, WindowsCompiler.Default);
+				VCEnv = VCEnvironment.SetEnvironment(CppPlatform.Win64, WindowsPlatform.GetDefaultCompiler());
 			}
 			catch (Exception)
 			{
