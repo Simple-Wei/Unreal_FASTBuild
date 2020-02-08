@@ -1,6 +1,6 @@
 // Copyright 2018 Yassine Riahi and Liam Flookes. Provided under a MIT License, see license file on github.
 // Used to generate a fastbuild .bff file from UnrealBuildTool to allow caching and distributed builds. 
-// Tested with Windows 8.1/10, Visual Studio 2019, Unreal Engine 4.23, FastBuild v0.98
+// Tested with Windows 8.1/10, Visual Studio 2019, Unreal Engine 4.25, FastBuild v1.00
 // Durango is fully supported (Compiles with VS2015).
 // Orbis will likely require some changes.
 using System;
@@ -37,6 +37,9 @@ namespace UnrealBuildTool
 
 		// Controls whether enable fastcancel mode
 		private bool bFastCancel = false;
+
+        // Controls whether disable local race of remotely started jobs.
+		private bool bNoLocalRace = true;
 
 		// Controls whether using FastBuild Mod
 		// Following ObjectListNode options are added to better support UE + FastBuild integration
@@ -554,7 +557,7 @@ namespace UnrealBuildTool
 				if (BuildType == FBBuildType.Windows)
 				{
 					WindowsCompiler windowsCompiler = WindowsCompiler.VisualStudio2019;
-					VCEnv = VCEnvironment.Create(windowsCompiler, UnrealTargetPlatform.Win64, WindowsArchitecture.x64, null, null);
+					VCEnv = VCEnvironment.Create(windowsCompiler, UnrealTargetPlatform.Win64, WindowsArchitecture.x64, null, null, null);
 				}
 				else if (BuildType == FBBuildType.XBOne)
 				{
@@ -562,7 +565,7 @@ namespace UnrealBuildTool
 					// Translate the XboxOne compiler to the right Windows compiler to set the VC environment vars correctly...
 					//WindowsCompiler windowsCompiler = XboxOnePlatform.GetDefaultCompiler() == XboxOneCompiler.VisualStudio2015 ? WindowsCompiler.VisualStudio2015 : WindowsCompiler.VisualStudio2017;
 					WindowsCompiler windowsCompiler = WindowsCompiler.VisualStudio2017;
-					VCEnv = VCEnvironment.Create(windowsCompiler, UnrealTargetPlatform.Win64, WindowsArchitecture.x64, null, null);
+					VCEnv = VCEnvironment.Create(windowsCompiler, UnrealTargetPlatform.Win64, WindowsArchitecture.x64, null, null, null);
 				}
 			}
 			catch (Exception)
@@ -748,15 +751,34 @@ namespace UnrealBuildTool
 
 			if (IsIntelISPCAction(Action))
 			{
+				string[] ResponseFileOptions = { "@" };
+				var ParsedResponseFileOptions = ParseCommandLineOptions(CommandArguments, ResponseFileOptions);
+				string IspcResponseFilePath = GetOptionValue(ParsedResponseFileOptions, "@", Action);
+
+				string IspcInputFileName = "";
+
+				if (!string.IsNullOrEmpty(IspcResponseFilePath))
+				{
+					IspcInputFileName = ParsedResponseFileOptions["InputFile"];
+					CommandArguments = "@\"" + IspcResponseFilePath + "\"";
+				}
+
 				string[] ISPCSpecialCompilerOptions = { "-h", "-o" };
 				var ISPCParsedCompilerOptions = ParseCommandLineOptions(CommandArguments, ISPCSpecialCompilerOptions);
 
-				bool bHeaderOutput = true;
-				string ISPCOutputFileName = GetOptionValue(ISPCParsedCompilerOptions, "-h", Action, ProblemIfNotFound: false);
+				if (string.IsNullOrEmpty(IspcInputFileName))
+				{
+					IspcInputFileName = ISPCParsedCompilerOptions["InputFile"];
+				}
+				if (string.IsNullOrEmpty(IspcInputFileName))
+				{
+					Console.WriteLine("We have no InputFileName for IntelISPC. Bailing.");
+					return false;
+				}
 
+				string ISPCOutputFileName = GetOptionValue(ISPCParsedCompilerOptions, "-h", Action, ProblemIfNotFound: false);
 				if (string.IsNullOrEmpty(ISPCOutputFileName))
 				{
-					bHeaderOutput = false;
 					ISPCOutputFileName = GetOptionValue(ISPCParsedCompilerOptions, "-o", Action, ProblemIfNotFound: true);
 				}
 
@@ -768,10 +790,10 @@ namespace UnrealBuildTool
 
 				AddText(string.Format("Exec('Action_{0}')\n{{\n", ActionIndex));
 				AddText(string.Format("\t.ExecExecutable = '{0}'\n", Action.CommandPath));
-				AddText(string.Format("\t.ExecArguments = '\"%1\" {0} \"%2\" {1}'\n", bHeaderOutput ? "-h" : "-o", GetOptionValue(ISPCParsedCompilerOptions, "OtherOptions", Action)));
-				AddText(string.Format("\t.ExecInput = {{ {0} }} \n", ISPCParsedCompilerOptions["InputFile"]));
+				AddText(string.Format("\t.ExecArguments = '{0}'\n", Action.CommandArguments));
+				AddText(string.Format("\t.ExecInput = {{ {0} }} \n", IspcInputFileName));
 				AddText(string.Format("\t.ExecOutput = '{0}' \n", ISPCOutputFileName));
-				AddText(string.Format("\t.PreBuildDependencies = {{ {0} }} \n", ISPCParsedCompilerOptions["InputFile"]));
+				AddText(string.Format("\t.PreBuildDependencies = {{ {0} }} \n", IspcInputFileName));
 				AddText(string.Format("}}\n\n"));
 
 				return true;
@@ -1247,7 +1269,25 @@ namespace UnrealBuildTool
 			return true;
 		}
 
-		private FileStream bffOutputFileStream = null;
+		private void AddCopyAction(List<Action> Actions, int ActionIndex, List<int> DependencyIndices)
+		{
+			Action Action = Actions[ActionIndex];
+			{
+				string[] CopyOptions = { "/C" };
+				var ParsedCopyOptions = ParseCommandLineOptions(Action.CommandArguments, CopyOptions, SaveResponseFile: false);
+				string CommandArguments = GetOptionValue(ParsedCopyOptions, "/C", Action);
+				string[] RawTokens = CommandArguments.Trim().Split('"');
+				if (RawTokens.Length > 4)
+				{
+					AddText(string.Format("Copy('Action_{0}')\n{{\n", ActionIndex));
+					AddText(string.Format("\t.Source = '{0}'\n", RawTokens[RawTokens.Length - 4]));
+					AddText(string.Format("\t.Dest = '{0}'\n", RawTokens[RawTokens.Length - 2]));
+					AddText(string.Format("}}\n\n"));
+				}
+			}
+		}
+
+	    private FileStream bffOutputFileStream = null;
 
 		private List<int> FastBuildActionIndices = new List<int>();
 		private List<int> FastBuildTouchActionIndices = new List<int>();
@@ -1266,7 +1306,7 @@ namespace UnrealBuildTool
 				{
 					Action Action = Actions[ActionIndex];
 
-					AddText(string.Format("// \"{0}\" {1}\n", Action.CommandPath, Action.CommandArguments));
+					AddText(string.Format("// {0} \"{1}\" {2}\n", Action.ActionType, Action.CommandPath, Action.CommandArguments));
 					List<string> ProducedItems = Action.ProducedItems.ConvertAll(x => string.Format("'{0}'", x.Name));
 					AddText(string.Format("//\t=> Producing({0}): \"{1}\"\n", ProducedItems.Count, string.Join("", ProducedItems.ToArray())));
 
@@ -1298,7 +1338,17 @@ namespace UnrealBuildTool
 								FastBuildActionIndices.Add(ActionIndex);
 							}
 							break;
-						case ActionType.BuildProject: PreBuildLocalExecutorActions.Add(Action); break;
+						case ActionType.BuildProject:
+                            if (Action.CommandPath.FullName.Contains("cmd.exe") && Action.CommandArguments.Contains("copy") && Action.CommandArguments.Contains(".ispc.generated."))
+							{
+								AddCopyAction(Actions, ActionIndex, DependencyIndices);
+								FastBuildActionIndices.Add(ActionIndex);
+							}
+							else
+                            {
+								PostBuildLocalExecutorActions.Add(Action);
+							}
+							break;
 						default: PostBuildLocalExecutorActions.Add(Action); break;
 					}
 				}
@@ -1366,10 +1416,12 @@ namespace UnrealBuildTool
 
 			string fastCancelArgument = bFastCancel ? "-fastcancel" : "";
 
+			string noLocalRaceArgument = bNoLocalRace ? "-nolocalrace" : "";
+
 			//Interesting flags for FASTBuild: -nostoponerror, -verbose, -monitor (if FASTBuild Monitor Visual Studio Extension is installed!)
 			// Yassine: The -clean is to bypass the FastBuild internal dependencies checks (cached in the fdb) as it could create some conflicts with UBT.
 			//			Basically we want FB to stupidly compile what UBT tells it to.
-			string FBCommandLine = string.Format("-monitor -summary {0} {1} {2} {3} -ide -clean {4} -config \"{5}\"", distArgument, cacheArgument, verboseArgument, distVerboseArgument, fastCancelArgument, BffFilePath);
+			string FBCommandLine = string.Format("-monitor -summary {0} {1} {2} {3} -ide -clean {4} {5} -config \"{6}\"", distArgument, cacheArgument, verboseArgument, distVerboseArgument, fastCancelArgument, noLocalRaceArgument, BffFilePath);
 
 			ProcessStartInfo FBStartInfo = new ProcessStartInfo(string.IsNullOrEmpty(FBuildExePathOverride) ? "fbuild" : FBuildExePathOverride, FBCommandLine);
 
